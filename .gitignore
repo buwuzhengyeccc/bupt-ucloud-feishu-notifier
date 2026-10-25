@@ -1,0 +1,33 @@
+# Local SSH credentials
+/ucloud_notify
+/ucloud_notify.pub
+.ssh/
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime secrets and private state
+.env
+.env.*
+!.env.example
+debug/
+data/
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.har
+wheelhouse/
+
+# Private deployment and verification records
+/DEPLOYMENT.md
+/SYSTEM_OVERVIEW.md
