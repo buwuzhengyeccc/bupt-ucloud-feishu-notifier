@@ -1,9 +1,11 @@
 import tempfile
+from contextlib import closing
 from pathlib import Path
 import unittest
 import time
 import json
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 import httpx
 
 from security import safe_url, shape
@@ -16,6 +18,145 @@ from login import cas_state
 
 
 class CoreTests(unittest.TestCase):
+    def test_a_new_failure_does_not_overwrite_an_unsent_recovery_of_the_same_kind(self):
+        with tempfile.TemporaryDirectory() as directory, closing(Store(Path(directory) / 'state.db')) as store:
+            with patch('storage.time.time', return_value=1000):
+                store.mark_alert('notice_list_not_loaded')
+            with patch('storage.time.time', return_value=1100):
+                store.mark_recovered()
+            first = store.pending_recoveries()[0]
+            with patch('storage.time.time', return_value=1200):
+                store.record_failure('notice_list_not_loaded')
+                self.assertFalse(store.alert_due('notice_list_not_loaded'))
+            with patch('storage.time.time', return_value=1300):
+                store.mark_recovered()
+            self.assertEqual(store.pending_recoveries(), [first])
+            with patch('storage.time.time', return_value=5000):
+                store.record_failure('notice_list_not_loaded')
+                self.assertTrue(store.alert_due('notice_list_not_loaded'))
+                store.mark_alert('notice_list_not_loaded')
+            with patch('storage.time.time', return_value=5100):
+                store.mark_recovered()
+            self.assertEqual([r['recovered_at'] for r in store.pending_recoveries()], [1100, 5100])
+            store.finish_recovery(first['id'])
+            self.assertEqual([r['recovered_at'] for r in store.pending_recoveries()], [5100])
+
+    def test_instance_name_is_configurable_without_account_credentials(self):
+        from config import Config, ConfigError
+        values = {'BUPT_USERNAME': 'demo', 'BUPT_PASSWORD': 'dummy',
+                  'FEISHU_WEBHOOK': 'https://open.feishu.cn/open-apis/bot/v2/hook/' + 'example-hook-0000'}
+        with patch('config.dotenv_values', return_value=values), patch.dict('config.os.environ', {}, clear=True):
+            self.assertEqual(Config.load().instance_name, '默认实例')
+            with patch.dict('config.os.environ', {'INSTANCE_NAME': '第二账号'}):
+                self.assertEqual(Config.load().instance_name, '第二账号')
+            with patch.dict('config.os.environ', {'INSTANCE_NAME': 'invalid\nname'}):
+                with self.assertRaises(ConfigError):
+                    Config.load()
+
+    def test_successful_poll_without_new_notices_sends_one_named_recovery(self):
+        from service import notify_recoveries
+        with tempfile.TemporaryDirectory() as directory, closing(Store(Path(directory) / 'state.db')) as store:
+            with patch('storage.time.time', return_value=1000):
+                store.record_failure('notice_list_not_loaded')
+                store.mark_alert('notice_list_not_loaded')
+            sender = Mock()
+            with patch('storage.time.time', return_value=1142):
+                notify_recoveries(sender, store, '原账号', 0)
+            message = sender.send_text.call_args.args[0]
+            self.assertIn('恢复通知【原账号】', message)
+            self.assertIn('notice_list_not_loaded', message)
+            self.assertIn('0小时2分22秒', message)
+            self.assertIn('当前共 0 条通知', message)
+            notify_recoveries(sender, store, '原账号', 0)
+            sender.send_text.assert_called_once()
+            self.assertEqual(store.pending_recoveries(), [])
+
+    def test_failed_recovery_push_is_retried_after_restart_with_original_recovery_time(self):
+        from service import notify_recoveries
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.db'
+            sender = Mock()
+            with closing(Store(path)) as store:
+                with patch('storage.time.time', return_value=1000):
+                    store.mark_alert('active_role_not_observed')
+                sender.send_text.side_effect = PushError('network')
+                with patch('storage.time.time', return_value=1142):
+                    notify_recoveries(sender, store, '第二账号', 30)
+                self.assertEqual(len(store.pending_recoveries()), 1)
+            with closing(Store(path)) as store:
+                sender.send_text.side_effect = None
+                with patch('storage.time.time', return_value=1800):
+                    notify_recoveries(sender, store, '第二账号', 30)
+                self.assertEqual(sender.send_text.call_count, 2)
+                self.assertEqual(sender.send_text.call_args_list[0], sender.send_text.call_args_list[1])
+                self.assertEqual(store.pending_recoveries(), [])
+
+    def test_failed_or_suppressed_fault_alert_does_not_create_an_unmatched_recovery(self):
+        from service import notify_recoveries, report_login_failure
+        with tempfile.TemporaryDirectory() as directory, closing(Store(Path(directory) / 'state.db')) as store:
+            sender = Mock()
+            sender.send_text.side_effect = PushError('network')
+            with self.assertRaises(PushError):
+                report_login_failure(sender, store, 'notice_list_not_loaded', '原账号')
+            sender.send_text.side_effect = None
+            notify_recoveries(sender, store, '原账号', 44)
+            sender.send_text.assert_called_once()
+            for kind in ('login_cooldown', 'login_network_unavailable'):
+                report_login_failure(sender, store, kind, '原账号')
+            notify_recoveries(sender, store, '原账号', 44)
+            sender.send_text.assert_called_once()
+            self.assertEqual(store.pending_recoveries(), [])
+
+    def test_service_only_reports_recovery_after_a_complete_successful_poll(self):
+        from service import run
+        from login import LoginError
+        for recovers in (False, True):
+            with self.subTest(recovers=recovers), tempfile.TemporaryDirectory() as directory:
+                store = Store(Path(directory) / 'state.db')
+                store.baseline([])
+                source, sender, stop = Mock(), Mock(), Mock()
+                sender.batches.return_value = []
+                source.fetch.side_effect = [LoginError('notice_list_not_loaded'), []]
+                source.session = {'expires_at': time.time() + 7200}
+                source.last_page_count = 1
+                stop.is_set.side_effect = [False, False, True] if recovers else [False, True]
+                with patch('service.Store', return_value=store), patch('service.Fetcher', return_value=source), \
+                     patch('service.Feishu', return_value=sender), patch('service.threading.Event', return_value=stop), \
+                     patch('service.signal.signal'), patch('service.write_json'):
+                    run(SimpleNamespace(interval=60, instance_name='第二账号'))
+                messages = [c.args[0] for c in sender.send_text.call_args_list]
+                self.assertIn('登录告警【第二账号】', messages[0])
+                self.assertEqual(len(messages), 2 if recovers else 1)
+                if recovers:
+                    self.assertIn('恢复通知【第二账号】', messages[1])
+
+    def test_alert_recovery_persists_until_acknowledged_and_keeps_first_recovery_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.db'
+            with closing(Store(path)) as store:
+                with patch('storage.time.time', return_value=1000):
+                    store.record_failure('notice_list_not_loaded')
+                with patch('storage.time.time', return_value=1010):
+                    store.mark_alert('notice_list_not_loaded')
+                with patch('storage.time.time', return_value=1050):
+                    store.record_failure('notice_list_not_loaded')
+            with closing(Store(path)) as store:
+                with patch('storage.time.time', return_value=1142):
+                    store.mark_recovered()
+                pending = store.pending_recoveries()
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0], {'id': 1, 'kind': 'notice_list_not_loaded',
+                    'started_at': 1000, 'alerted_at': 1010, 'recovered_at': 1142})
+            with closing(Store(path)) as store:
+                with patch('storage.time.time', return_value=1200):
+                    store.mark_recovered()
+                    self.assertFalse(store.alert_due('notice_list_not_loaded'))
+                self.assertEqual(store.pending_recoveries(), pending)
+                store.finish_recovery(pending[0]['id'])
+                self.assertEqual(store.pending_recoveries(), [])
+                with patch('storage.time.time', return_value=5000):
+                    self.assertTrue(store.alert_due('notice_list_not_loaded'))
+
     def test_baseline_survives_restart_and_only_acknowledged_ids_are_seen(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.db'

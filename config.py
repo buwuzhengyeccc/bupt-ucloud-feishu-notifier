@@ -24,6 +24,7 @@ class Config:
     webhook: str = field(repr=False)
     secret: str = field(default='', repr=False)
     interval: int = 60
+    instance_name: str = '默认实例'
 
     @classmethod
     def load(cls, path=None):
@@ -36,8 +37,11 @@ class Config:
             raise ConfigError('POLL_INTERVAL must be an integer') from None
         if interval < 30:
             raise ConfigError('POLL_INTERVAL must be at least 30 seconds')
+        instance_name = get('INSTANCE_NAME', '默认实例').strip()
+        if not 1 <= len(instance_name) <= 40 or any(c in instance_name for c in '\r\n'):
+            raise ConfigError('INSTANCE_NAME must contain 1-40 characters on one line')
         result = cls(get('BUPT_USERNAME').strip(), get('BUPT_PASSWORD'),
-                     get('FEISHU_WEBHOOK').strip(), get('FEISHU_SECRET').strip(), interval)
+                     get('FEISHU_WEBHOOK').strip(), get('FEISHU_SECRET').strip(), interval, instance_name)
         if not result.username or not result.password:
             raise ConfigError('BUPT_USERNAME and BUPT_PASSWORD are required')
         try:
